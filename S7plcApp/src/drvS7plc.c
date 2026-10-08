@@ -15,6 +15,7 @@
 #define SET_TIMEOUT_ERROR WSASetLastError(WSAETIMEDOUT)
 #else
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #define SOCKFMT "d"
 #define NFDS(fd) fd+1
@@ -50,7 +51,12 @@
 #include "drvS7plc.h"
 
 #define CONNECT_TIMEOUT   5.0  /* connect timeout [s] */
-#define RECONNECT_DELAY  30.0  /* delay before reconnect [s] */
+#define RECONNECT_DELAY_MIN  1.0  /* first delay before reconnect [s] */
+#define RECONNECT_DELAY_MAX 30.0  /* delay doubles after each failure up to this [s] */
+#define KEEPALIVE_IDLE     5   /* idle time before first keepalive probe [s] */
+#define KEEPALIVE_INTVL    1   /* interval between keepalive probes [s] */
+#define KEEPALIVE_CNT      3   /* unanswered probes before connection is dead */
+#define USER_TIMEOUT   10000   /* max time sent data may stay unacknowledged [ms] */
 
 STATIC long s7plcIoReport(int level);
 STATIC long s7plcInit();
@@ -60,6 +66,7 @@ STATIC void s7plcReceiveThread(s7plcStation* station);
 STATIC int s7plcWaitForInput(s7plcStation* station, double timeout);
 STATIC int s7plcConnect(s7plcStation* station);
 STATIC void s7plcCloseConnection(s7plcStation* station);
+STATIC void s7plcSetKeepalive(s7plcStation* station, SOCKET sock);
 STATIC int s7plcCheckConnection(s7plcStation* station);
 STATIC void s7plcSignal(void* event);
 s7plcStation* s7plcStationList = NULL;
@@ -79,6 +86,11 @@ epicsExportAddress(drvet, s7plc);
 
 int s7plcDebug = 0;
 epicsExportAddress(int, s7plcDebug);
+
+/* Close the connection if no data arrives for this many recvTimeouts
+ * between blocks (0 = never close on idle) */
+int s7plcIdleTimeouts = 5;
+epicsExportAddress(int, s7plcIdleTimeouts);
 
 struct s7plcStation {
     struct s7plcStation* next;
@@ -497,6 +509,7 @@ STATIC void s7plcSendThread(s7plcStation* station)
 {
     char* sendBuf = callocMustSucceed(1, station->outSize, "s7plcSendThread");
     char errmsg[100];
+    double reconnectDelay = RECONNECT_DELAY_MIN;
 
     s7plcDebugLog(1, "s7plcSendThread %s: started\n",
             station->name);
@@ -512,10 +525,16 @@ STATIC void s7plcSendThread(s7plcStation* station)
             s7plcDebugLog(1,
                 "s7plcMain %s: connect to %s:%d failed. Retry in %g seconds\n",
                 station->name, station->server, station->serverPort,
-                (double)RECONNECT_DELAY);
-            epicsThreadSleep(RECONNECT_DELAY);
+                reconnectDelay);
+            epicsThreadSleep(reconnectDelay);
+            /* back off so an unreachable PLC isn't hammered, but keep
+             * the first retries after a short outage quick */
+            reconnectDelay *= 2;
+            if (reconnectDelay > RECONNECT_DELAY_MAX)
+                reconnectDelay = RECONNECT_DELAY_MAX;
             continue;
         }
+        reconnectDelay = RECONNECT_DELAY_MIN;
 
         epicsTimerStartDelay(station->timer, station->sendIntervall);
         s7plcDebugLog(2, "s7plcSendThread %s: look for data to send\n",
@@ -532,25 +551,40 @@ STATIC void s7plcSendThread(s7plcStation* station)
 
                 if (station->sock != INVALID_SOCKET)
                 {
-                    int written;
+                    unsigned int sent = 0;
                     s7plcDebugLog(2,
                         "s7plcSendThread %s: sending %d bytes\n",
                         station->name, station->outSize);
-                    written=send(station->sock, sendBuf, station->outSize, 0);
-                    if (written < 0)
+                    /* send() may write fewer bytes than asked for a large or
+                     * non-blocking socket - loop until the whole frame is
+                     * out or a real error / disconnect happens, instead of
+                     * just logging and silently dropping the remainder. */
+                    while (sent < station->outSize)
                     {
-                        epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
-                        s7plcErrorLog(
-                            "s7plcSendThread %s: send(%d, ..., %d, 0) failed: %s\n",
-                            station->name,
-                            station->sock, station->outSize, errmsg);
-                        s7plcCloseConnection(station);
-                    }
-                    else if ((unsigned int)written < station->outSize)
-                    {
-                        s7plcErrorLog(
-                            "s7plcSendThread %s: send wrote only %d of %d bytes\n",
-                            station->name, written, station->outSize);
+                        int written = send(station->sock, sendBuf+sent, station->outSize-sent, 0);
+                        if (written < 0)
+                        {
+                            epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
+                            s7plcErrorLog(
+                                "s7plcSendThread %s: send(%d, ..., %d, 0) failed: %s\n",
+                                station->name,
+                                station->sock, station->outSize-sent, errmsg);
+                            s7plcCloseConnection(station);
+                            break;
+                        }
+                        if (written == 0)
+                        {
+                            s7plcErrorLog(
+                                "s7plcSendThread %s: send returned 0, connection closed by %s\n",
+                                station->name, station->server);
+                            s7plcCloseConnection(station);
+                            break;
+                        }
+                        sent += written;
+                        if (sent < station->outSize)
+                            s7plcDebugLog(1,
+                                "s7plcSendThread %s: partial send, wrote %d of %d bytes so far, retrying\n",
+                                station->name, sent, station->outSize);
                     }
                 }
             }
@@ -567,6 +601,8 @@ STATIC void s7plcSendThread(s7plcStation* station)
 STATIC void s7plcReceiveThread(s7plcStation* station)
 {
     unsigned char* recvBuf = callocMustSucceed(1, station->inSize, "s7plcReceiveThread");
+    double reconnectDelay = RECONNECT_DELAY_MIN;
+    int gotFrame = 0; /* a complete frame arrived on the current connection */
 
     s7plcDebugLog(1, "s7plcReceiveThread %s: started\n",
             station->name);
@@ -576,6 +612,8 @@ STATIC void s7plcReceiveThread(s7plcStation* station)
         unsigned int input;
         double timeout;
         double waitTime;
+        double idleTime;
+        int quietLogged;
         int received;
         int status;
         epicsTimeStamp start, end;
@@ -590,12 +628,19 @@ STATIC void s7plcReceiveThread(s7plcStation* station)
             s7plcDebugLog(1,
                 "s7plcMain %s: connect to %s:%d failed. Retry in %g seconds\n",
                 station->name, station->server, station->serverPort,
-                (double)RECONNECT_DELAY);
-            epicsThreadSleep(RECONNECT_DELAY);
+                reconnectDelay);
+            epicsThreadSleep(reconnectDelay);
+            /* back off so an unreachable PLC isn't hammered, but keep
+             * the first retries after a short outage quick */
+            reconnectDelay *= 2;
+            if (reconnectDelay > RECONNECT_DELAY_MAX)
+                reconnectDelay = RECONNECT_DELAY_MAX;
             continue;
         }
 
         input = 0;
+        idleTime = 0.0;
+        quietLogged = 0;
         timeout = station->recvTimeout;
         /* check (with timeout) for data arrival from server */
         while (station->sock != INVALID_SOCKET && input < station->inSize)
@@ -617,7 +662,43 @@ STATIC void s7plcReceiveThread(s7plcStation* station)
                 s7plcCloseConnection(station);
                 break;
             }
-            if (status > 0)
+            if (status == 0)
+            {
+                /* A stall in the middle of a frame (input > 0) means the
+                 * framing is broken: reconnect to resync. */
+                if (input > 0)
+                {
+                    s7plcErrorLog(
+                        "s7plcReceiveThread %s: timeout after %d of %d bytes - "
+                        "partial frame stalled, reconnecting\n",
+                        station->name, input, station->inSize);
+                    s7plcCloseConnection(station);
+                    break;
+                }
+                /* Silence between frames: tolerate a short gap, but a peer
+                 * that is powered off or unplugged never sends FIN/RST, so
+                 * after s7plcIdleTimeouts recvTimeouts treat the connection
+                 * as dead. Closing it puts the records into alarm and lets
+                 * the reconnect logic pick up a restarted PLC. */
+                idleTime += waitTime;
+                if (!quietLogged)
+                {
+                    s7plcErrorLog(
+                        "s7plcReceiveThread %s: no data from %s for %g seconds\n",
+                        station->name, station->server, idleTime);
+                    quietLogged = 1;
+                }
+                if (s7plcIdleTimeouts > 0 &&
+                    idleTime >= station->recvTimeout * s7plcIdleTimeouts)
+                {
+                    s7plcErrorLog(
+                        "s7plcReceiveThread %s: no data from %s for %g seconds, reconnecting\n",
+                        station->name, station->server, idleTime);
+                    s7plcCloseConnection(station);
+                    break;
+                }
+                continue;
+            }
             {
                 int receiveSize = station->inSize;
 
@@ -646,16 +727,14 @@ STATIC void s7plcReceiveThread(s7plcStation* station)
                 if (s7plcDebug >= 4)
                     hexdump(recvBuf+input, received, 1);
                 input += received;
-            }
-            if (status <= 0 && timeout > 0.0)
-            {
-                epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
-                s7plcErrorLog(
-                    "s7plcReceiveThread %s: read error after %d of %d bytes: %s\n",
-                    station->name,
-                    input, station->inSize, errmsg);
-                s7plcCloseConnection(station);
-                break;
+                if (quietLogged)
+                {
+                    s7plcErrorLog(
+                        "s7plcReceiveThread %s: data from %s resumed after %g seconds\n",
+                        station->name, station->server, idleTime + waitTime);
+                    quietLogged = 0;
+                }
+                idleTime = 0.0;
             }
         }
         if (station->sock != INVALID_SOCKET)
@@ -668,21 +747,36 @@ STATIC void s7plcReceiveThread(s7plcStation* station)
                 "s7plcReceiveThread %s: receive successful, notify all input records\n",
                 station->name);
             scanIoRequest(station->inScanPvt);
+            gotFrame = 1;
+            reconnectDelay = RECONNECT_DELAY_MIN;
+        }
+        else if (gotFrame)
+        {
+            /* lost a working connection: reconnect at once, so a short
+             * hiccup costs milliseconds instead of a fixed sleep */
+            s7plcDebugLog(1,
+                "s7plcReceiveThread %s: connection down, reconnecting\n",
+                station->name);
+            gotFrame = 0;
         }
         else
         {
+            /* the connection died before delivering any data: back off,
+             * so a PLC that accepts and drops at once isn't hammered */
             s7plcDebugLog(1,
                 "s7plcReceiveThread %s: connection down, sleeping %g seconds\n",
-                station->name, CONNECT_TIMEOUT/4);
-            /* lost connection. Wait some time */
-            epicsThreadSleep(CONNECT_TIMEOUT/4);
+                station->name, reconnectDelay);
+            epicsThreadSleep(reconnectDelay);
+            reconnectDelay *= 2;
+            if (reconnectDelay > RECONNECT_DELAY_MAX)
+                reconnectDelay = RECONNECT_DELAY_MAX;
         }
     }
 }
 
 STATIC int s7plcWaitForInput(s7plcStation* station, double timeout)
 {
-    static struct timeval to;
+    struct timeval to;
     SOCKET sock;
     int iSelect;
     fd_set socklist;
@@ -712,13 +806,12 @@ STATIC int s7plcWaitForInput(s7plcStation* station, double timeout)
         s7plcErrorLog("s7plcWaitForInput %s: interrupted by signal\n",
             station->name);
     }
-    if (iSelect==0 && timeout > 0)            /* timed out */
+    if (iSelect==0 && timeout > 0)            /* timed out: no data yet, not an error */
     {
-        s7plcErrorLog(
-            "s7plcWaitForInput %s: timeout after %g seconds.\n",
+        s7plcDebugLog(1,
+            "s7plcWaitForInput %s: no data within %g seconds.\n",
             station->name, timeout);
-        SET_TIMEOUT_ERROR;
-        return -1;
+        return 0;
     }
     return iSelect;
 }
@@ -849,12 +942,59 @@ STATIC int s7plcConnect(s7plcStation* station)
     /* connected */
     nonblocking = 0;
     ioctl(sock, FIONBIO, &nonblocking);
+    s7plcSetKeepalive(station, sock);
     s7plcErrorLog(
         "s7plcConnect %s: connected to %s:%d\n",
         station->name, station->server, station->serverPort);
 
     station->sock = sock;
     return 0;
+}
+
+/* Let the OS detect a dead peer (power loss, pulled cable) independently of
+ * the idle timeout. Keepalive (~8 s) covers an idle connection and fires
+ * before the default idle close (5 x recvTimeout); TCP_USER_TIMEOUT covers
+ * unacknowledged output, where keepalive is suspended and retransmissions
+ * would otherwise take ~15 minutes. Failures are logged but not fatal. */
+STATIC void s7plcSetKeepalive(s7plcStation* station, SOCKET sock)
+{
+    int on = 1;
+    char errmsg[100];
+
+#ifdef TCP_USER_TIMEOUT
+    {
+        unsigned int userTimeout = USER_TIMEOUT;
+        if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT, (void*)&userTimeout, sizeof(userTimeout)) < 0)
+        {
+            epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
+            s7plcErrorLog(
+                "s7plcConnect %s: setsockopt(TCP_USER_TIMEOUT) failed (ignored): %s\n",
+                station->name, errmsg);
+        }
+    }
+#endif
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (void*)&on, sizeof(on)) < 0)
+    {
+        epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
+        s7plcErrorLog(
+            "s7plcConnect %s: setsockopt(SO_KEEPALIVE) failed (ignored): %s\n",
+            station->name, errmsg);
+        return;
+    }
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+    {
+        int idle = KEEPALIVE_IDLE, intvl = KEEPALIVE_INTVL, cnt = KEEPALIVE_CNT;
+        if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (void*)&idle, sizeof(idle)) < 0 ||
+            setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (void*)&intvl, sizeof(intvl)) < 0 ||
+            setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (void*)&cnt, sizeof(cnt)) < 0)
+        {
+            epicsSocketConvertErrnoToString(errmsg, sizeof(errmsg));
+            s7plcErrorLog(
+                "s7plcConnect %s: setting keepalive timing failed (ignored): %s\n",
+                station->name, errmsg);
+        }
+    }
+#endif
 }
 
 STATIC void s7plcCloseConnection(s7plcStation* station)
